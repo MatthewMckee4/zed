@@ -119,7 +119,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use ztracing::instrument;
 
 use std::cell::RefCell;
-use std::collections::hash_map::Entry;
+use std::collections::{VecDeque, hash_map::Entry};
 use std::{
     any::TypeId,
     borrow::Cow,
@@ -1814,98 +1814,92 @@ impl DisplaySnapshot {
         language_aware: LanguageAwareStyling,
         editor_style: &'a EditorStyle,
     ) -> impl Iterator<Item = HighlightedChunk<'a>> {
-        self.chunks(
+        let mut chunks = self.chunks(
             display_rows,
             language_aware,
             HighlightStyles {
                 inlay_hint: Some(editor_style.inlay_hints_style),
                 edit_prediction: Some(editor_style.edit_prediction_styles),
             },
-        )
-        .flat_map({
-            // track the current underline style so that we can apply it to
-            // inlay hints within the diagnostic's span
-            let mut current_diagnostic_underline: Option<UnderlineStyle> = None;
+        );
+        let diagnostics_max_severity = self.diagnostics_max_severity;
+        let mut pending_chunks = VecDeque::new();
+        let mut previous_diagnostic_underline: Option<UnderlineStyle> = None;
 
-            move |chunk| {
-                let syntax_highlight_style = chunk
-                    .syntax_highlight_id
-                    .and_then(|id| editor_style.syntax.get(id).cloned());
+        iter::from_fn(move || {
+            if let Some((chunk, diagnostic_highlight)) = pending_chunks.pop_front() {
+                return Some(highlighted_chunk_from_display_chunk(
+                    chunk,
+                    diagnostic_highlight,
+                    editor_style,
+                ));
+            }
 
-                let chunk_highlight = chunk.highlight_style.map(|chunk_highlight| {
-                    HighlightStyle {
-                        // For color inlays, blend the color with the editor background
-                        // if the color has transparency (alpha < 1.0)
-                        color: chunk_highlight.color.map(|color| {
-                            if chunk.is_inlay && !color.is_opaque() {
-                                editor_style.background.blend(color)
-                            } else {
-                                color
-                            }
-                        }),
-                        underline: chunk_highlight
-                            .underline
-                            .filter(|_| editor_style.show_underlines),
-                        ..chunk_highlight
-                    }
-                });
+            let chunk = chunks.next()?;
+            if !chunk.is_inlay {
+                let diagnostic_highlight =
+                    diagnostic_highlight_for_chunk(&chunk, diagnostics_max_severity, editor_style);
+                previous_diagnostic_underline = diagnostic_highlight
+                    .as_ref()
+                    .and_then(|highlight| highlight.underline);
+                return Some(highlighted_chunk_from_display_chunk(
+                    chunk,
+                    diagnostic_highlight,
+                    editor_style,
+                ));
+            }
 
-                let diagnostic_highlight = if chunk.is_inlay {
-                    current_diagnostic_underline.map(|underline| HighlightStyle {
-                        underline: Some(underline),
-                        ..Default::default()
-                    })
+            let mut inlay_chunks = vec![chunk];
+
+            for next_chunk in chunks.by_ref() {
+                if next_chunk.is_inlay {
+                    inlay_chunks.push(next_chunk);
                 } else {
-                    let highlight = chunk
-                        .diagnostic_severity
-                        .filter(|severity| {
-                            self.diagnostics_max_severity
-                                .into_lsp()
-                                .is_some_and(|max_severity| severity <= &max_severity)
-                        })
-                        .map(|severity| HighlightStyle {
-                            fade_out: chunk
-                                .is_unnecessary
-                                .then_some(editor_style.unnecessary_code_fade),
-                            underline: (chunk.underline
-                                && editor_style.show_underlines
-                                && !(chunk.is_unnecessary
-                                    && severity > lsp::DiagnosticSeverity::WARNING))
-                                .then(|| {
-                                    let diagnostic_color =
-                                        diagnostic_style(severity, &editor_style.status);
-                                    UnderlineStyle {
-                                        color: Some(diagnostic_color),
-                                        thickness: 1.0.into(),
-                                        wavy: true,
-                                    }
-                                }),
+                    let next_diagnostic_highlight = diagnostic_highlight_for_chunk(
+                        &next_chunk,
+                        diagnostics_max_severity,
+                        editor_style,
+                    );
+                    let next_diagnostic_underline = next_diagnostic_highlight
+                        .as_ref()
+                        .and_then(|highlight| highlight.underline);
+                    let bridged_diagnostic_underline =
+                        previous_diagnostic_underline.filter(|previous_underline| {
+                            Some(*previous_underline) == next_diagnostic_underline
+                        });
+                    let inlay_diagnostic_highlight =
+                        bridged_diagnostic_underline.map(|underline| HighlightStyle {
+                            underline: Some(underline),
                             ..Default::default()
                         });
 
-                    current_diagnostic_underline = highlight.as_ref().and_then(|h| h.underline);
-                    highlight
-                };
-
-                let style = [
-                    syntax_highlight_style,
-                    chunk_highlight,
-                    diagnostic_highlight,
-                ]
-                .into_iter()
-                .flatten()
-                .reduce(|acc, highlight| acc.highlight(highlight));
-
-                HighlightedChunk {
-                    text: chunk.text,
-                    style,
-                    is_tab: chunk.is_tab,
-                    is_inlay: chunk.is_inlay,
-                    replacement: chunk.renderer.map(ChunkReplacement::Renderer),
+                    pending_chunks.extend(
+                        inlay_chunks
+                            .into_iter()
+                            .map(|chunk| (chunk, inlay_diagnostic_highlight)),
+                    );
+                    pending_chunks.push_back((next_chunk, next_diagnostic_highlight));
+                    previous_diagnostic_underline = next_diagnostic_underline;
+                    return pending_chunks
+                        .pop_front()
+                        .map(|(chunk, diagnostic_highlight)| {
+                            highlighted_chunk_from_display_chunk(
+                                chunk,
+                                diagnostic_highlight,
+                                editor_style,
+                            )
+                        });
                 }
-                .highlight_invisibles(editor_style)
             }
+
+            pending_chunks.extend(inlay_chunks.into_iter().map(|chunk| (chunk, None)));
+            pending_chunks
+                .pop_front()
+                .map(|(chunk, diagnostic_highlight)| {
+                    highlighted_chunk_from_display_chunk(chunk, diagnostic_highlight, editor_style)
+                })
         })
+        .flat_map(|chunk| chunk.highlight_invisibles(editor_style))
     }
 
     /// Returns combined highlight styles (tree-sitter syntax + semantic tokens)
@@ -2441,6 +2435,82 @@ impl DisplaySnapshot {
             Bias::Right,
         )
     }
+}
+
+fn highlighted_chunk_from_display_chunk<'a>(
+    chunk: fold_map::Chunk<'a>,
+    diagnostic_highlight: Option<HighlightStyle>,
+    editor_style: &'a EditorStyle,
+) -> HighlightedChunk<'a> {
+    let syntax_highlight_style = chunk
+        .syntax_highlight_id
+        .and_then(|id| editor_style.syntax.get(id).cloned());
+
+    let chunk_highlight = chunk.highlight_style.map(|chunk_highlight| HighlightStyle {
+        color: chunk_highlight.color.map(|color| {
+            if chunk.is_inlay && !color.is_opaque() {
+                editor_style.background.blend(color)
+            } else {
+                color
+            }
+        }),
+        underline: chunk_highlight
+            .underline
+            .filter(|_| editor_style.show_underlines),
+        ..chunk_highlight
+    });
+
+    let style = [
+        syntax_highlight_style,
+        chunk_highlight,
+        diagnostic_highlight,
+    ]
+    .into_iter()
+    .flatten()
+    .reduce(|acc, highlight| acc.highlight(highlight));
+
+    HighlightedChunk {
+        text: chunk.text,
+        style,
+        is_tab: chunk.is_tab,
+        is_inlay: chunk.is_inlay,
+        replacement: chunk.renderer.map(ChunkReplacement::Renderer),
+    }
+}
+
+fn diagnostic_highlight_for_chunk(
+    chunk: &fold_map::Chunk<'_>,
+    diagnostics_max_severity: DiagnosticSeverity,
+    editor_style: &EditorStyle,
+) -> Option<HighlightStyle> {
+    if chunk.is_inlay {
+        return None;
+    }
+
+    chunk
+        .diagnostic_severity
+        .filter(|severity| {
+            diagnostics_max_severity
+                .into_lsp()
+                .is_some_and(|max_severity| severity <= &max_severity)
+        })
+        .map(|severity| HighlightStyle {
+            fade_out: chunk
+                .is_unnecessary
+                .then_some(editor_style.unnecessary_code_fade),
+            underline: (chunk.underline
+                && editor_style.show_underlines
+                && !(chunk.is_unnecessary && severity > lsp::DiagnosticSeverity::WARNING))
+                .then(|| {
+                    let diagnostic_color = diagnostic_style(severity, &editor_style.status);
+                    UnderlineStyle {
+                        color: Some(diagnostic_color),
+                        thickness: 1.0.into(),
+                        wavy: true,
+                    }
+                }),
+            ..Default::default()
+        })
 }
 
 fn diagnostic_style(severity: lsp::DiagnosticSeverity, colors: &StatusColors) -> Hsla {
@@ -3486,6 +3556,162 @@ pub mod tests {
                 (" = ".into(), None, black),
                 ("1".into(), None, red),
                 (";\n".into(), None, black),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn test_diagnostic_underlines_only_extend_through_inlay_bridges(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| init_test(cx, &|_| {}));
+
+        fn point(row: u32, column: usize) -> PointUtf16 {
+            PointUtf16::new(row, column as u32)
+        }
+
+        fn error_diagnostic(message: &str) -> Diagnostic {
+            Diagnostic {
+                severity: lsp::DiagnosticSeverity::ERROR,
+                message: message.into(),
+                ..Default::default()
+            }
+        }
+
+        #[derive(Debug, PartialEq, Eq)]
+        enum RenderedChunkKind {
+            Buffer,
+            Inlay,
+        }
+
+        #[derive(Debug, PartialEq, Eq)]
+        struct RenderedChunk {
+            text: String,
+            kind: RenderedChunkKind,
+            underlined: bool,
+        }
+
+        impl RenderedChunk {
+            fn buffer(text: &str, underlined: bool) -> Self {
+                Self {
+                    text: text.into(),
+                    kind: RenderedChunkKind::Buffer,
+                    underlined,
+                }
+            }
+
+            fn inlay(text: &str, underlined: bool) -> Self {
+                Self {
+                    text: text.into(),
+                    kind: RenderedChunkKind::Inlay,
+                    underlined,
+                }
+            }
+        }
+
+        let boundary_word = "boundary";
+        let bridge_word = "bridged";
+        let diagnostic_continuation = " =";
+        let boundary_inlay = " [end]";
+        let bridge_inlay = " [bridge]";
+        let buffer_text = format!("{boundary_word} = value\n{bridge_word} = total\n");
+        let boundary_row = 0;
+        let bridge_row = 1;
+
+        let buffer = cx.new(|cx| Buffer::local(buffer_text, cx));
+        buffer.update(cx, |buffer, cx| {
+            buffer.update_diagnostics(
+                LanguageServerId(0),
+                DiagnosticSet::new(
+                    [
+                        DiagnosticEntry {
+                            range: point(boundary_row, 0)..point(boundary_row, boundary_word.len()),
+                            diagnostic: error_diagnostic("ends before inlay"),
+                        },
+                        DiagnosticEntry {
+                            range: point(bridge_row, 0)
+                                ..point(
+                                    bridge_row,
+                                    bridge_word.len() + diagnostic_continuation.len(),
+                                ),
+                            diagnostic: error_diagnostic("continues after inlay"),
+                        },
+                    ],
+                    buffer,
+                ),
+                cx,
+            )
+        });
+
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        let buffer_snapshot = buffer.read_with(cx, |buffer, cx| buffer.snapshot(cx));
+        let map = cx.new(|cx| {
+            DisplayMap::new(
+                buffer,
+                font("Courier"),
+                px(16.0),
+                None,
+                1,
+                1,
+                FoldPlaceholder::test(),
+                DiagnosticSeverity::Warning,
+                cx,
+            )
+        });
+
+        map.update(cx, |map, cx| {
+            map.splice_inlays(
+                &[],
+                vec![
+                    Inlay::mock_hint(
+                        0,
+                        buffer_snapshot
+                            .anchor_after(Point::new(boundary_row, boundary_word.len() as u32)),
+                        boundary_inlay,
+                    ),
+                    Inlay::mock_hint(
+                        1,
+                        buffer_snapshot
+                            .anchor_after(Point::new(bridge_row, bridge_word.len() as u32)),
+                        bridge_inlay,
+                    ),
+                ],
+                cx,
+            );
+        });
+
+        let snapshot = map.update(cx, |map, cx| map.snapshot(cx));
+        let editor_style = EditorStyle::default();
+        let chunks = snapshot
+            .highlighted_chunks(
+                DisplayRow(0)..DisplayRow(2),
+                LanguageAwareStyling {
+                    tree_sitter: false,
+                    diagnostics: true,
+                },
+                &editor_style,
+            )
+            .map(|chunk| {
+                let constructor = if chunk.is_inlay {
+                    RenderedChunk::inlay
+                } else {
+                    RenderedChunk::buffer
+                };
+                constructor(
+                    chunk.text,
+                    chunk.style.and_then(|style| style.underline).is_some(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            chunks,
+            [
+                RenderedChunk::buffer(boundary_word, true),
+                RenderedChunk::inlay(boundary_inlay, false),
+                RenderedChunk::buffer(" = value\n", false),
+                RenderedChunk::buffer(bridge_word, true),
+                RenderedChunk::inlay(bridge_inlay, true),
+                RenderedChunk::buffer(diagnostic_continuation, true),
+                RenderedChunk::buffer(" total\n", false),
             ]
         );
     }
